@@ -14,15 +14,17 @@ struct ASFAppInfo: ASFAppInfoBehavior {
     }
 
     var targetSDK: String {
-        var targetSDK: String = ""
-#if os(iOS) || os(watchOS) || os(tvOS)
-        targetSDK = "\(__IPHONE_OS_VERSION_MIN_REQUIRED)"
-#elseif os(macOS)
-        targetSDK = "\(__MAC_OS_X_VERSION_MIN_REQUIRED)"
-#else
-        targetSDK = "Unknown"
-#endif
-        return targetSDK
+        #if os(iOS) || os(tvOS) || os(watchOS)
+        // Matches __IPHONE_OS_VERSION_MIN_REQUIRED semantics
+        let min = Bundle.main.object(forInfoDictionaryKey: "MinimumOSVersion") as? String ?? ""
+        return min
+        #elseif os(macOS)
+        // Matches __MAC_OS_X_VERSION_MIN_REQUIRED semantics
+        let min = Bundle.main.object(forInfoDictionaryKey: "LSMinimumSystemVersion") as? String ?? ""
+        return min
+        #else
+        return "Unknown"
+        #endif
     }
 
     var version: String {
