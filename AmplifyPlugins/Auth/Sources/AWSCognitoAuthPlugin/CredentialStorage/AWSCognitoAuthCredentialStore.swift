@@ -6,305 +6,307 @@
 //
 
 import Amplify
-@preconcurrency import Foundation
-import Security
+import Foundation
+@_spi(KeychainStore) import AWSPluginsCore
 
-// swiftlint:disable identifier_name
-public protocol KeychainStoreBehavior {
+struct AWSCognitoAuthCredentialStore {
 
-    /// Get a string value from the Keychain based on the key.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameter key: A String key use to look up the value in the Keychain
-    /// - Returns: A string value
-    @_spi(KeychainStore)
-    func _getString(_ key: String) throws -> String
+    // Credential store constants
+    private let service = "com.amplify.awsCognitoAuthPlugin"
+    private let sharedService = "com.amplify.awsCognitoAuthPluginShared"
+    private let sessionKey = "session"
+    private let deviceMetadataKey = "deviceMetadata"
+    private let deviceASFKey = "deviceASF"
+    private let authConfigurationKey = "authConfiguration"
 
-    /// Get a data value from the Keychain based on the key.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameter key: A String key use to look up the value in the Keychain
-    /// - Returns: A data value
-    @_spi(KeychainStore)
-    func _getData(_ key: String) throws -> Data
-
-    /// Set a key-value pair in the Keychain.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameters:
-    ///   - value: A string value to store in Keychain
-    ///   - key: A String key for the value to store in the Keychain
-    @_spi(KeychainStore)
-    func _set(_ value: String, key: String) throws
-
-    /// Set a key-value pair in the Keychain.
-    /// This iSystem Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameters:
-    ///   - value: A data value to store in Keychain
-    ///   - key: A String key for the value to store in the Keychain
-    @_spi(KeychainStore)
-    func _set(_ value: Data, key: String) throws
-
-    /// Remove key-value pair from Keychain based on the provided key.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameter key: A String key to delete the key-value pair
-    @_spi(KeychainStore)
-    func _remove(_ key: String) throws
-
-    /// Removes all key-value pair in the Keychain.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    @_spi(KeychainStore)
-    func _removeAll() throws
-
-    /// Checks if the Keychain contains any items for this service and access group.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Returns: `true` if at least one item exists, `false` otherwise
-    @_spi(KeychainStore)
-    func _hasItems() throws -> Bool
-
-}
-
-public struct KeychainStore: KeychainStoreBehavior {
-
-    let attributes: KeychainStoreAttributes
-
-    private init(attributes: KeychainStoreAttributes) {
-        self.attributes = attributes
+    // User defaults constants
+    private let userDefaultsNameSpace = "amplify_secure_storage_scopes.awsCognitoAuthPlugin"
+    /// This UserDefaults Key is use to retrieve the stored access group to determine
+    /// which access group the migration should happen from
+    /// If none is found, the unshared service is used for migration and all items
+    /// under that service are queried
+    private var accessGroupKey: String {
+        "\(userDefaultsNameSpace).accessGroup"
     }
 
-    public init() {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
-            fatalError("Unable to retrieve bundle identifier to initialize keychain")
+    private let authConfiguration: AuthConfiguration
+    private let keychain: KeychainStoreBehavior
+    private let userDefaults = UserDefaults.standard
+    private let accessGroup: String?
+
+    init(
+        authConfiguration: AuthConfiguration,
+        accessGroup: String? = nil,
+        migrateKeychainItemsOfUserSession: Bool = false
+    ) {
+        self.authConfiguration = authConfiguration
+        self.accessGroup = accessGroup
+        if let accessGroup {
+            self.keychain = KeychainStore(service: sharedService, accessGroup: accessGroup)
+        } else {
+            self.keychain = KeychainStore(service: service)
         }
-        self.init(service: bundleIdentifier)
-    }
 
-    public init(service: String) {
-        self.init(service: service, accessGroup: nil)
-    }
-
-    public init(service: String, accessGroup: String? = nil) {
-        self.attributes = KeychainStoreAttributes(service: service, accessGroup: accessGroup)
-        log.verbose(
-            "[KeychainStore] Initialized keychain with service=\(service), " +
-            "attributes=\(attributes), " +
-            "accessGroup=\(attributes.accessGroup ?? "No access group specified")"
-        )
-    }
-
-    /// Get a string value from the Keychain based on the key.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameter key: A String key use to look up the value in the Keychain
-    /// - Returns: A string value
-    @_spi(KeychainStore)
-    public func _getString(_ key: String) throws -> String {
-        log.verbose("[KeychainStore] Started retrieving `String` from the store with key=\(key)")
-        let data = try _getData(key)
-        guard let string = String(data: data, encoding: .utf8) else {
-            log.error("[KeychainStore] Unable to create String from Data retrieved")
-            throw KeychainStoreError.conversionError("Unable to create String from Data retrieved")
-        }
-        log.verbose("[KeychainStore] Successfully retrieved `String` from the store")
-        return string
-
-    }
-
-    /// Get a data value from the Keychain based on the key.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameter key: A String key use to look up the value in the Keychain
-    /// - Returns: A data value
-    @_spi(KeychainStore)
-    public func _getData(_ key: String) throws -> Data {
-        log.verbose("[KeychainStore] Started retrieving `Data` from the store with key=\(key)")
-        var query = attributes.defaultGetQuery()
-
-        query[Constants.MatchLimit] = Constants.MatchLimitOne
-        query[Constants.ReturnData] = kCFBooleanTrue
-
-        query[Constants.AttributeAccount] = key
-
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        switch status {
-        case errSecSuccess:
-            guard let data = result as? Data else {
-                log.error("[KeychainStore] The keychain item retrieved is not the correct type")
-                throw KeychainStoreError.unknown("The keychain item retrieved is not the correct type")
+        let oldAccessGroup = retrieveStoredAccessGroup()
+        if migrateKeychainItemsOfUserSession {
+            try? migrateKeychainItemsToAccessGroup()
+        } else if oldAccessGroup == nil && oldAccessGroup != accessGroup {
+            // Only clear the old keychain if the shared keychain doesn't already have items.
+            // This prevents data loss when an app extension (e.g., widget) initializes before
+            // the main app has a chance to record the migration in UserDefaults, since
+            // UserDefaults is not shared between app and extensions.
+            if !sharedKeychainHasItems(accessGroup: accessGroup) {
+                try? KeychainStore(service: service)._removeAll()
             }
-            log.verbose("[KeychainStore] Successfully retrieved `Data` from the store with key=\(key)")
-            return data
-        case errSecItemNotFound:
-            log.verbose("[KeychainStore] No Keychain item found for key=\(key)")
-            throw KeychainStoreError.itemNotFound
-        default:
-            log.error("[KeychainStore] Error of status=\(status) occurred when attempting to retrieve a Keychain item for key=\(key)")
-            throw KeychainStoreError.securityError(status)
         }
+
+        saveStoredAccessGroup()
+
+        // NOTE: We intentionally do NOT clear keychain credentials on app reinstall.
+        // Previously, this code checked a UserDefaults flag (isKeychainConfiguredKey) to detect
+        // fresh installs and clear orphaned keychain items. However, this approach was unreliable
+        // because UserDefaults can return false during iOS prewarming (background app launch after
+        // device reboot) when protected data is not yet available. This caused valid credentials
+        // to be incorrectly cleared, resulting in random user logouts.
+        //
+        // Keychain items persisting across app reinstalls is iOS's default behavior. Any stale
+        // credentials will naturally fail authentication and trigger a proper sign-out flow.
+        // See: https://github.com/aws-amplify/amplify-swift/issues/3972
+
+        restoreCredentialsOnConfigurationChanges(currentAuthConfig: authConfiguration)
+        // Save the current configuration
+        saveAuthConfiguration(authConfig: authConfiguration)
     }
 
-    /// Set a key-value pair in the Keychain.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameters:
-    ///   - value: A string value to store in Keychain
-    ///   - key: A String key for the value to store in the Keychain
-    @_spi(KeychainStore)
-    public func _set(_ value: String, key: String) throws {
-        log.verbose("[KeychainStore] Started setting `String` for key=\(key)")
-        guard let data = value.data(using: .utf8, allowLossyConversion: false) else {
-            log.error("[KeychainStore] Unable to create Data from String retrieved for key=\(key)")
-            throw KeychainStoreError.conversionError("Unable to create Data from String retrieved")
+    // The method is responsible for migrating any old credentials to the new namespace
+    private func restoreCredentialsOnConfigurationChanges(currentAuthConfig: AuthConfiguration) {
+
+        guard let oldAuthConfigData = getAuthConfiguration() else {
+            return
         }
-        try _set(data, key: key)
-        log.verbose("[KeychainStore] Successfully added `String` for key=\(key)")
-    }
+        let oldNameSpace = generateSessionKey(for: oldAuthConfigData)
+        let newNameSpace = generateSessionKey(for: currentAuthConfig)
 
-    /// Set a key-value pair in the Keychain.
-    /// This iSystem Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameters:
-    ///   - value: A data value to store in Keychain
-    ///   - key: A String key for the value to store in the Keychain
-    @_spi(KeychainStore)
-    public func _set(_ value: Data, key: String) throws {
-        log.verbose("[KeychainStore] Started setting `Data` for key=\(key)")
-        var getQuery = attributes.defaultGetQuery()
-        getQuery[Constants.AttributeAccount] = key
-        log.verbose("[KeychainStore] Initialized fetching to decide whether update or add")
-        let fetchStatus = SecItemCopyMatching(getQuery as CFDictionary, nil)
-        switch fetchStatus {
-        case errSecSuccess:
-            #if os(macOS)
-            log.verbose("[KeychainStore] Deleting item on MacOS to add an item.")
-            SecItemDelete(getQuery as CFDictionary)
-            fallthrough
-            #else
-            log.verbose("[KeychainStore] Found existing item, updating")
-            var attributesToUpdate = [String: Any]()
-            attributesToUpdate[Constants.ValueData] = value
+        let oldUserPoolConfiguration = oldAuthConfigData.getUserPoolConfiguration()
+        let oldIdentityPoolConfiguration = oldAuthConfigData.getIdentityPoolConfiguration()
+        let newIdentityConfigData = currentAuthConfig.getIdentityPoolConfiguration()
+        let newUserPoolConfiguration = currentAuthConfig.getUserPoolConfiguration()
 
-            let updateStatus = SecItemUpdate(getQuery as CFDictionary, attributesToUpdate as CFDictionary)
-            if updateStatus != errSecSuccess {
-                log.error("[KeychainStore] Error updating item to keychain with status=\(updateStatus)")
-                throw KeychainStoreError.securityError(updateStatus)
+        /// Migrate if
+        ///  - Old User Pool Config didn't exist
+        ///  - New Identity Config Data exists
+        ///  - Old Identity Pool Config == New Identity Pool Config
+        if oldUserPoolConfiguration == nil &&
+            newIdentityConfigData != nil &&
+            oldIdentityPoolConfiguration == newIdentityConfigData {
+            // retrieve data from the old namespace and save with the new namespace
+            if let oldCognitoCredentialsData = try? keychain._getData(oldNameSpace) {
+                try? keychain._set(oldCognitoCredentialsData, key: newNameSpace)
             }
-            log.verbose("[KeychainStore] Successfully updated `Data` in keychain for key=\(key)")
-            #endif
-        case errSecItemNotFound:
-            log.verbose("[KeychainStore] Unable to find an existing item, creating new item")
-            var attributesToSet = attributes.defaultSetQuery()
-            attributesToSet[Constants.AttributeAccount] = key
-            attributesToSet[Constants.ValueData] = value
-
-            let addStatus = SecItemAdd(attributesToSet as CFDictionary, nil)
-            if addStatus != errSecSuccess {
-                log.error("[KeychainStore] Error adding item to keychain with status=\(addStatus)")
-                throw KeychainStoreError.securityError(addStatus)
+        /// Migrate if
+        ///  - Old config and new config are different
+        ///  - Old Userpool Existed
+        ///  - Old and new user pool namespacing is the same
+        } else if oldAuthConfigData != currentAuthConfig &&
+                    oldUserPoolConfiguration != nil &&
+                    UserPoolConfigurationData.isNamespacingEqual(
+                        lhs: oldUserPoolConfiguration,
+                        rhs: newUserPoolConfiguration
+                    ) {
+            // retrieve data from the old namespace and save with the new namespace
+            if let oldCognitoCredentialsData = try? keychain._getData(oldNameSpace) {
+                try? keychain._set(oldCognitoCredentialsData, key: newNameSpace)
             }
-            log.verbose("[KeychainStore] Successfully added `Data` in keychain for key=\(key)")
-        default:
-            log.error("[KeychainStore] Error occurred while retrieving data from keychain when deciding to update or add with status=\(fetchStatus)")
-            throw KeychainStoreError.securityError(fetchStatus)
+        } else if oldAuthConfigData != currentAuthConfig &&
+                    oldNameSpace != newNameSpace {
+            // Clear the old credentials
+            try? keychain._remove(oldNameSpace)
         }
     }
 
-    /// Remove key-value pair from Keychain based on the provided key.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Parameter key: A String key to delete the key-value pair
-    @_spi(KeychainStore)
-    public func _remove(_ key: String) throws {
-        log.verbose("[KeychainStore] Starting to remove item from keychain with key=\(key)")
-        var query = attributes.defaultGetQuery()
-        query[Constants.AttributeAccount] = key
+    private func storeKey(for authConfiguration: AuthConfiguration) -> String {
+        let prefix = "amplify"
+        var suffix = ""
 
-        let status = SecItemDelete(query as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound {
-            log.error("[KeychainStore] Error removing items from keychain with status=\(status)")
-            throw KeychainStoreError.securityError(status)
+        switch authConfiguration {
+        case .userPools(let userPoolConfigurationData):
+            suffix = userPoolConfigurationData.poolId
+        case .identityPools(let identityPoolConfigurationData):
+            suffix = identityPoolConfigurationData.poolId
+        case .userPoolsAndIdentityPools(let userPoolConfigurationData, let identityPoolConfigurationData):
+            suffix = "\(userPoolConfigurationData.poolId).\(identityPoolConfigurationData.poolId)"
         }
-        log.verbose("[KeychainStore] Successfully removed item from keychain")
+
+        return "\(prefix).\(suffix)"
     }
 
-    /// Removes all key-value pair in the Keychain.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    @_spi(KeychainStore)
-    public func _removeAll() throws {
-        log.verbose("[KeychainStore] Starting to remove all items from keychain")
-        var query = attributes.defaultGetQuery()
-        #if os(macOS)
-        query[Constants.MatchLimit] = Constants.MatchLimitAll
-        #endif
-
-        let status = SecItemDelete(query as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound {
-            log.error("[KeychainStore] Error removing all items from keychain with status=\(status)")
-            throw KeychainStoreError.securityError(status)
-        }
-        log.verbose("[KeychainStore] Successfully removed all items from keychain")
+    private func generateSessionKey(for authConfiguration: AuthConfiguration) -> String {
+        return "\(storeKey(for: authConfiguration)).\(sessionKey)"
     }
 
-    /// Checks if the Keychain contains any items for this service and access group.
-    /// This System Programming Interface (SPI) may have breaking changes in future updates.
-    /// - Returns: `true` if at least one item exists, `false` otherwise
-    @_spi(KeychainStore)
-    public func _hasItems() throws -> Bool {
-        log.verbose("[KeychainStore] Checking if keychain has any items")
-        var query = attributes.defaultGetQuery()
-        query[Constants.MatchLimit] = Constants.MatchLimitOne
+    private func generateDeviceMetadataKey(
+        for username: String,
+        with configuration: AuthConfiguration
+    ) -> String {
+            return "\(storeKey(for: authConfiguration)).\(username).\(deviceMetadataKey)"
+    }
 
-        let status = SecItemCopyMatching(query as CFDictionary, nil)
-        switch status {
-        case errSecSuccess:
-            log.verbose("[KeychainStore] Keychain has items")
-            return true
-        case errSecItemNotFound:
-            log.verbose("[KeychainStore] Keychain has no items")
-            return false
-        default:
-            log.error("[KeychainStore] Error checking keychain items with status=\(status)")
-            throw KeychainStoreError.securityError(status)
+    private func generateASFDeviceKey(
+        for username: String,
+        with configuration: AuthConfiguration
+    ) -> String {
+            return "\(storeKey(for: authConfiguration)).\(username).\(deviceASFKey)"
+    }
+
+    private func saveAuthConfiguration(authConfig: AuthConfiguration) {
+        if let encodedAuthConfigData = try? encode(object: authConfig) {
+            try? keychain._set(encodedAuthConfigData, key: authConfigurationKey)
+        }
+    }
+
+    private func getAuthConfiguration() -> AuthConfiguration? {
+        if let userPoolConfigData = try? keychain._getData(authConfigurationKey) {
+            return try? decode(data: userPoolConfigData)
+        }
+        return nil
+    }
+
+}
+
+extension AWSCognitoAuthCredentialStore: AmplifyAuthCredentialStoreBehavior {
+
+    func saveCredential(_ credential: AmplifyCredentials) throws {
+        let authCredentialStoreKey = generateSessionKey(for: authConfiguration)
+        let encodedCredentials = try encode(object: credential)
+        try keychain._set(encodedCredentials, key: authCredentialStoreKey)
+    }
+
+    func retrieveCredential() throws -> AmplifyCredentials {
+        let authCredentialStoreKey = generateSessionKey(for: authConfiguration)
+        let authCredentialData = try keychain._getData(authCredentialStoreKey)
+        let amplifyCredential: AmplifyCredentials = try decode(data: authCredentialData)
+        return amplifyCredential
+    }
+
+    func deleteCredential() throws {
+        let authCredentialStoreKey = generateSessionKey(for: authConfiguration)
+        try keychain._remove(authCredentialStoreKey)
+    }
+
+    func saveDevice(_ deviceMetadata: DeviceMetadata, for username: String) throws {
+        let key = generateDeviceMetadataKey(for: username, with: authConfiguration)
+        let encodedMetadata = try encode(object: deviceMetadata)
+        try keychain._set(encodedMetadata, key: key)
+    }
+
+    func retrieveDevice(for username: String) throws -> DeviceMetadata {
+        let key = generateDeviceMetadataKey(for: username, with: authConfiguration)
+        let encodedDeviceMetadata = try keychain._getData(key)
+        let deviceMetadata: DeviceMetadata = try decode(data: encodedDeviceMetadata)
+        return deviceMetadata
+    }
+
+    func removeDevice(for username: String) throws {
+        let key = generateDeviceMetadataKey(for: username, with: authConfiguration)
+        try keychain._remove(key)
+    }
+
+    func saveASFDevice(_ deviceId: String, for username: String) throws {
+        let key = generateASFDeviceKey(for: username, with: authConfiguration)
+        let encodedMetadata = try encode(object: deviceId)
+        try keychain._set(encodedMetadata, key: key)
+    }
+
+    func retrieveASFDevice(for username: String) throws -> String {
+        let key = generateASFDeviceKey(for: username, with: authConfiguration)
+        let encodedData = try keychain._getData(key)
+        let asfID: String = try decode(data: encodedData)
+        return asfID
+    }
+
+    func removeASFDevice(for username: String) throws {
+        let key = generateASFDeviceKey(for: username, with: authConfiguration)
+        try keychain._remove(key)
+    }
+
+    private func clearAllCredentials() throws {
+        try keychain._removeAll()
+    }
+
+    private func retrieveStoredAccessGroup() -> String? {
+        return userDefaults.string(forKey: accessGroupKey)
+    }
+
+    private func saveStoredAccessGroup() {
+        if let accessGroup {
+            userDefaults.set(accessGroup, forKey: accessGroupKey)
+        } else {
+            userDefaults.removeObject(forKey: accessGroupKey)
+        }
+    }
+
+    private func migrateKeychainItemsToAccessGroup() throws {
+        let oldAccessGroup = retrieveStoredAccessGroup()
+
+        if oldAccessGroup == accessGroup {
+            log.info("[AWSCognitoAuthCredentialStore] Stored access group is the same as current access group, aborting migration")
+            return
+        }
+
+        // If the shared keychain already has items, migration has already occurred
+        // (likely by the main app). Skip migration to prevent data loss.
+        // This check is necessary because UserDefaults is not shared between app and extensions,
+        // so the extension may not know that migration already happened.
+        if sharedKeychainHasItems(accessGroup: accessGroup) {
+            log.info("[AWSCognitoAuthCredentialStore] Shared keychain already has items, migration already completed, aborting")
+            return
+        }
+
+        let oldService = oldAccessGroup != nil ? sharedService : service
+        let newService = accessGroup != nil ? sharedService : service
+
+        do {
+            try KeychainStoreMigrator(oldService: oldService, newService: newService, oldAccessGroup: oldAccessGroup, newAccessGroup: accessGroup).migrate()
+        } catch {
+            log.error("[AWSCognitoAuthCredentialStore] Migration has failed")
+            return
+        }
+
+        log.verbose("[AWSCognitoAuthCredentialStore] Migration of keychain items from old access group to new access group successful")
+    }
+
+    /// Checks if the shared keychain (with the given access group) already contains items.
+    /// This is used to determine if migration has already occurred, which helps prevent
+    /// data loss when app extensions initialize with their own UserDefaults that don't
+    /// reflect the migration state recorded by the main app.
+    private func sharedKeychainHasItems(accessGroup: String?) -> Bool {
+        guard let accessGroup else { return false }
+
+        let sharedKeychain = KeychainStore(service: sharedService, accessGroup: accessGroup)
+        return (try? sharedKeychain._hasItems()) ?? false
+    }
+
+}
+
+/// Helpers for encode and decoding
+private extension AWSCognitoAuthCredentialStore {
+
+    func encode(object: some Codable) throws -> Data {
+        do {
+            return try JSONEncoder().encode(object)
+        } catch {
+            throw KeychainStoreError.codingError("Error occurred while encoding credentials", error)
+        }
+    }
+
+    func decode<T: Decodable>(data: Data) throws -> T {
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw KeychainStoreError.codingError("Error occurred while decoding credentials", error)
         }
     }
 
 }
 
-extension KeychainStore {
-    enum Constants {
-        /** Class Key Constant */
-        static let Class = String(kSecClass)
-        static let ClassGenericPassword = String(kSecClassGenericPassword)
-
-        /** Attribute Key Constants */
-        static let AttributeAccessGroup = String(kSecAttrAccessGroup)
-        static let AttributeAccount = String(kSecAttrAccount)
-        static let AttributeService = String(kSecAttrService)
-        static let AttributeGeneric = String(kSecAttrGeneric)
-        static let AttributeLabel = String(kSecAttrLabel)
-        static let AttributeComment = String(kSecAttrComment)
-        static let AttributeAccessible = String(kSecAttrAccessible)
-
-        /** Attribute Accessible Constants */
-        static let AttributeAccessibleAfterFirstUnlockThisDeviceOnly = String(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
-
-        /** Search Constants */
-        static let MatchLimit = String(kSecMatchLimit)
-        static let MatchLimitOne = kSecMatchLimitOne
-        static let MatchLimitAll = kSecMatchLimitAll
-
-        /** Return Type Key Constants */
-        static let ReturnData = String(kSecReturnData)
-        static let ReturnAttributes = String(kSecReturnAttributes)
-        static let ReturnRef = String(kSecReturnRef)
-
-        /** Value Type Key Constants */
-        static let ValueData = String(kSecValueData)
-
-        /** Indicates whether to treat macOS keychain items like iOS keychain items without setting kSecAttrSynchronizable */
-        static let UseDataProtectionKeyChain = String(kSecUseDataProtectionKeychain)
-    }
-}
-// swiftlint:enable identifier_name
-
-extension KeychainStore: DefaultLogger {
-    public static var log: Logger {
-        Amplify.Logging.logger(forNamespace: String(describing: self))
-    }
-
-    public nonisolated var log: Logger { Self.log }
-}
+extension AWSCognitoAuthCredentialStore: DefaultLogger { }
